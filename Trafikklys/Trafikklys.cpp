@@ -12,6 +12,21 @@
 // Følgende globale variabler, strukturer og funksjoner ble lagt til etter
 // startfilen for å implementere biler, automatisk ankomst og enkel
 // trafikklogikk. Kommentarene under forklarer kort hva hver del gjør.
+//
+// Kort oppsummering (norsk):
+// - `Car` struct: holder posisjon (x,y), retning, aktuell hastighet og maksimal hastighet.
+// - `g_cars`: vektor som inneholder alle biler i simuleringen.
+// - `SpawnCarFromWest` / `SpawnCarFromNorth`: funksjoner som oppretter nye biler.
+// - `UpdateCars`: kalles av en timer for å oppdatere posisjon og hastighet for alle biler.
+//    - Oppdatering skjer per retning og fra fremste til bakerste bil, slik at bakre biler
+//      reagerer på oppdatert posisjon til bilen foran i samme tick. Dette forhindrer kollisjoner.
+//    - Biler stopper ved rød i riktig stopplinje og tillates å kjøre hvis de allerede er
+//      inne i skjæringspunktet.
+//    - Det sjekkes også for motgående trafikk nær skjæringspunktet før man kjører inn,
+//      for å unngå at biler fra begge retninger entrer samtidig.
+// - `g_pw` og `g_pn` styrer sannsynlighet for automatisk ankomst fra vest/nord per sekund.
+// - Lyslogikk: 5-state syklus (Rød -> Rød+Gul -> Grønn -> Gul -> Rød). Varigheter settes i
+//    `g_stateDurations` (sekunder). En separat 1s timer teller ned til neste state.
 
 #define MAX_LOADSTRING 100
 
@@ -62,7 +77,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // TODO: Place code here.
+  
 
     // Initialize global strings
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
@@ -148,7 +163,6 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    return TRUE;
 }
 
-
 // Spawn-funksjoner: oppretter en bil og legger den til i g_cars.
 // Disse ble lagt til for å kunne sende biler inn i simuleringen ved
 // museklikk eller ved sannsynlighetsbasert ankomst.
@@ -182,11 +196,9 @@ void SpawnCarFromNorth(HWND hWnd)
     g_cars.push_back(c);
 }
 
-// Oppdatering av biler: enklere implementasjon uten sortering
-// For hver bil beregner vi ønsket hastighet basert på:
-// - lysstatus (kan den krysse?)
-// - nærmeste bil foran i samme retning (unngå kollisjon)
-// Biler akselererer eller bremser mot mål-hastigheten.
+// Oppdatering av biler: 
+// Funksjonen oppdaterer biler per retning
+// samt at de holder avstand til bilen foran.
 void UpdateCars(HWND hWnd)
 {
     if (!g_randSeeded) { std::srand((unsigned)std::time(NULL)); g_randSeeded = true; }
@@ -195,103 +207,84 @@ void UpdateCars(HWND hWnd)
     int h = rc.bottom - rc.top;
     int roadHalf = 75;
 
-    // Sannsynlighetsbasert ankomst: utføres omtrent hver 1000 ms
+    // Ankomster omtrent hver 1000 ms
     g_accumMs += G_MOVE_INTERVAL;
     if (g_accumMs >= 1000) {
         g_accumMs = 0;
-        double r1 = (double)std::rand() / RAND_MAX;
-        if (r1 < g_pw) SpawnCarFromWest(hWnd);
-        double r2 = (double)std::rand() / RAND_MAX;
-        if (r2 < g_pn) SpawnCarFromNorth(hWnd);
+        double r1 = (double)std::rand() / RAND_MAX; if (r1 < g_pw) SpawnCarFromWest(hWnd);
+        double r2 = (double)std::rand() / RAND_MAX; if (r2 < g_pn) SpawnCarFromNorth(hWnd);
     }
 
-    // intersection bounds
     int interL = w/2 - roadHalf;
     int interR = w/2 + roadHalf;
     int interT = h/2 - roadHalf;
     int interB = h/2 + roadHalf;
+    float stopX = (float)(interL - 12);
+    float stopY = (float)(interT - 12);
 
-    const float accel = 0.08f; // akselerasjon per tick
-    const float minGap = 28.0f; // ønsket minste avstand mellom biler
+    const float minGap = 36.0f;
 
-    // For å unngå kollisjoner oppdaterer vi biler per retning fra fremst til bakerst.
-    // Dette sørger for at bakre biler ser de oppdaterte posisjonene til bilene foran
-    // i samme tick og kan tilpasse farten korrekt.
+    // Lag lister per retning og sorter slik at front kommer først
     std::vector<int> we, ns;
     for (size_t i = 0; i < g_cars.size(); ++i) {
         if (g_cars[i].dir == DIR_WEST_EAST) we.push_back((int)i);
         else ns.push_back((int)i);
     }
-    // sorter etter posisjon (x eller y) stigende
-    std::sort(we.begin(), we.end(), [&](int a, int b){ return g_cars[a].x < g_cars[b].x; });
-    std::sort(ns.begin(), ns.end(), [&](int a, int b){ return g_cars[a].y < g_cars[b].y; });
+    std::sort(we.begin(), we.end(), [&](int a, int b){ return g_cars[a].x > g_cars[b].x; });
+    std::sort(ns.begin(), ns.end(), [&](int a, int b){ return g_cars[a].y > g_cars[b].y; });
 
-    // oppdater west->east fra front (stor x) til bak (liten x)
-    for (int k = (int)we.size()-1; k >= 0; --k) {
-        int i = we[k];
-        Car &c = g_cars[i];
+    auto occupiedBy = [&](Direction d){
+        for (auto &c : g_cars) if (c.dir == d) if (c.x >= interL && c.x <= interR && c.y >= interT && c.y <= interB) return true;
+        return false;
+    };
+
+    bool occupiedNS = occupiedBy(DIR_NORTH_SOUTH);
+    bool occupiedWE = occupiedBy(DIR_WEST_EAST);
+
+    // Oppdater biler vest->øst
+    for (int idx : we) {
+        Car &c = g_cars[idx];
         c.y = (float)(h/2);
-        bool inIntersection = (c.x >= interL && c.x <= interR && c.y >= interT && c.y <= interB);
-        bool horizGreen = (((g_lightState + 2) % 5) == 2);
-        float stopX = (float)(interL - 12);
-        float distToStop = stopX - c.x;
-        float targetSpeed = c.maxSpeed;
-        if (!horizGreen && !inIntersection && distToStop > 0.0f && distToStop <= 20.0f) targetSpeed = 0.0f;
+        bool inI = (c.x >= interL && c.x <= interR && c.y >= interT && c.y <= interB);
+        bool green = (((g_lightState + 2) % 5) == 2);
 
-        // finn nærmeste bil foran (oppdatert posisjon) - større x
+        float desired = c.maxSpeed;
+        // stopp kun hvis bilen er nær stopplinja og lyset er rødt
+        float distToStopX = stopX - c.x;
+        if (!green && !inI && distToStopX > 0.0f && distToStopX <= 20.0f) desired = 0.0f; // stopp ved rødt
+     
+        // hensyn bil foran
         float frontX = 1e9f;
-        for (int idx = 0; idx < (int)we.size(); ++idx) {
-            int j = we[idx];
-            if (j == i) continue;
-            if (g_cars[j].dir == c.dir && g_cars[j].x > c.x && g_cars[j].x < frontX) frontX = g_cars[j].x;
-        }
+        for (int j : we) if (g_cars[j].x > c.x && g_cars[j].x < frontX) frontX = g_cars[j].x;
         if (frontX < 1e8f) {
-            float gap = frontX - c.x;
-            if (gap < minGap) targetSpeed = 0.0f;
-            else if (gap < minGap + 40.0f) {
-                float factor = (gap - minGap) / 40.0f;
-                float limited = c.maxSpeed * factor;
-                targetSpeed = (targetSpeed < limited ? targetSpeed : limited);
-            }
+            float allowed = frontX - minGap - c.x; if (allowed < 0) allowed = 0; if (desired > allowed) desired = allowed;
         }
-        if (c.speed < targetSpeed) c.speed = (c.speed + accel < targetSpeed ? c.speed + accel : targetSpeed);
-        else if (c.speed > targetSpeed) c.speed = (c.speed - accel*2 > targetSpeed ? c.speed - accel*2 : targetSpeed);
+
+        c.speed = desired;
         c.x += c.speed;
     }
 
-    // oppdater north->south fra front (stor y) til bak (liten y)
-    for (int k = (int)ns.size()-1; k >= 0; --k) {
-        int i = ns[k];
-        Car &c = g_cars[i];
+    // Oppdater biler nord->sør
+    for (int idx : ns) {
+        Car &c = g_cars[idx];
         c.x = (float)(w/2);
-        bool inIntersection = (c.x >= interL && c.x <= interR && c.y >= interT && c.y <= interB);
-        bool vertGreen = (g_lightState == 2);
-        float stopY = (float)(interT - 12);
-        float distToStopY = stopY - c.y;
-        float targetSpeed = c.maxSpeed;
-        if (!vertGreen && !inIntersection && distToStopY > 0.0f && distToStopY <= 20.0f) targetSpeed = 0.0f;
+        bool inI = (c.x >= interL && c.x <= interR && c.y >= interT && c.y <= interB);
+        bool green = (g_lightState == 2);
 
+        float desired = c.maxSpeed;
+        // stopp kun hvis bilen er nær stopplinja og lyset er rødt
+        float distToStopY = stopY - c.y;
+        if (!green && !inI && distToStopY > 0.0f && distToStopY <= 20.0f) desired = 0.0f;
+    
         float frontY = 1e9f;
-        for (int idx = 0; idx < (int)ns.size(); ++idx) {
-            int j = ns[idx];
-            if (j == i) continue;
-            if (g_cars[j].dir == c.dir && g_cars[j].y > c.y && g_cars[j].y < frontY) frontY = g_cars[j].y;
-        }
-        if (frontY < 1e8f) {
-            float gap = frontY - c.y;
-            if (gap < minGap) targetSpeed = 0.0f;
-            else if (gap < minGap + 40.0f) {
-                float factor = (gap - minGap) / 40.0f;
-                float limited = c.maxSpeed * factor;
-                targetSpeed = (targetSpeed < limited ? targetSpeed : limited);
-            }
-        }
-        if (c.speed < targetSpeed) c.speed = (c.speed + accel < targetSpeed ? c.speed + accel : targetSpeed);
-        else if (c.speed > targetSpeed) c.speed = (c.speed - accel*2 > targetSpeed ? c.speed - accel*2 : targetSpeed);
+        for (int j : ns) if (g_cars[j].y > c.y && g_cars[j].y < frontY) frontY = g_cars[j].y;
+        if (frontY < 1e8f) { float allowed = frontY - minGap - c.y; if (allowed < 0) allowed = 0; if (desired > allowed) desired = allowed; }
+
+        c.speed = desired;
         c.y += c.speed;
     }
 
-    // remove cars outside window
+    // fjern biler utenfor vinduet
     for (auto it = g_cars.begin(); it != g_cars.end(); ) {
         if (it->x > w + 200 || it->y > h + 200) it = g_cars.erase(it);
         else ++it;
@@ -425,18 +418,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             int interT = h/2 - roadHalf;
             int interB = h/2 + roadHalf;
 
-            // Plasser lys nær skjæringspunktet, men uten å blokkere kjørebanen.
-            // Vertical (venstre) lys: plasser rett til venstre for skjæringspunktet,
-            // slik at lyshuset står utenfor veien og er synlig for nord-sør trafikk.
-            int lx = interL - 70;            // litt til venstre for intersection
-            int ly = h/2 - 280;               // sentrert vertikalt ved veisenter
+            // Plasser lys nær skjæringspunktet
+            // venstr lys: plasser rett til venstre for skjæringspunktet
+            int lx = interL - 70;            
+            int ly = h/2 - 280;              
             DrawLight(lx, ly, g_lightState, false);
 
-            // Horizontal (høyre/østgående) lys: plasser til høyre for skjæringspunktet og
-            // under den østgående veien, slik at det ikke dekker kjørefeltet.
+            // Horizontal lys:.
             int horizState = (g_lightState + 2) % 5;
-            int rx = interR + 10;           // rett til høyre for intersection
-            int ry = h/2 + 80;              // litt under den horisontale veien
+            int rx = interR + 10;
+            int ry = h/2 + 80;   
             DrawLight(rx, ry, horizState, true);
 
             // draw cars
